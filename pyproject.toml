@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monarch-money-cli"
+version = "0.1.0"
+description = "CLI wrapper for the unofficial Monarch Money Python client"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "monarchmoney>=0.1.15",
+]
+
+[project.scripts]
+monarch = "monarch_cli.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
