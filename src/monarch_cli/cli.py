@@ -3,13 +3,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import json
 import os
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
 from .client import CLIError, create_client, require_saved_session
-from .config import default_session_file, ensure_parent_dir
+from .config import (
+    default_auth_file,
+    default_session_file,
+    ensure_parent_dir,
+    load_auth_payload,
+    load_auth_token,
+    save_auth_payload,
+    utcnow_iso,
+)
 from .dates import current_month_bounds, month_bounds, validate_date_pair
 from .render import emit_json, format_money, format_percent, print_key_values, print_table
 
@@ -23,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--session-file",
         default=str(default_session_file()),
         help="Path to the saved session file.",
+    )
+    parser.add_argument(
+        "--auth-file",
+        default=str(default_auth_file()),
+        help="Path to the saved token auth file.",
     )
     parser.add_argument(
         "--timeout",
@@ -49,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     auth_parser = subparsers.add_parser("auth", help="Manage login state.")
     auth_subparsers = auth_parser.add_subparsers(dest="auth_command", required=True)
 
-    login_parser = auth_subparsers.add_parser("login", help="Create or refresh a session.")
+    login_parser = auth_subparsers.add_parser("login", help="Create or refresh a legacy session.")
     login_parser.add_argument("--email", help="Monarch account email.")
     login_parser.add_argument("--password", help="Monarch account password.")
     login_parser.add_argument(
@@ -68,10 +85,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     login_parser.set_defaults(handler=handle_auth_login)
 
+    login_web_parser = auth_subparsers.add_parser(
+        "login-web",
+        parents=[json_parent],
+        help="Open Monarch in the OpenClaw browser and save a token.",
+    )
+    login_web_parser.add_argument(
+        "--browser-profile",
+        default=os.environ.get("MONARCH_BROWSER_PROFILE", "openclaw"),
+        help="OpenClaw browser profile to use.",
+    )
+    login_web_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=int(os.environ.get("MONARCH_LOGIN_TIMEOUT_SECONDS", "300")),
+        help="Seconds to wait for web login to complete.",
+    )
+    login_web_parser.set_defaults(handler=handle_auth_login_web)
+
+    import_token_parser = auth_subparsers.add_parser(
+        "import-token",
+        parents=[json_parent],
+        help="Save a Monarch API token for CLI use.",
+    )
+    import_token_parser.add_argument(
+        "import_token",
+        nargs="?",
+        help="Token to save. Defaults to MONARCH_TOKEN if omitted.",
+    )
+    import_token_parser.set_defaults(handler=handle_auth_import_token)
+
     logout_parser = auth_subparsers.add_parser(
         "logout",
         parents=[json_parent],
-        help="Delete the saved session file.",
+        help="Delete saved auth/session state.",
     )
     logout_parser.set_defaults(handler=handle_auth_logout)
 
@@ -228,6 +275,94 @@ def session_file_from_args(args: argparse.Namespace) -> Path:
     return Path(args.session_file).expanduser()
 
 
+def auth_file_from_args(args: argparse.Namespace) -> Path:
+    return Path(args.auth_file).expanduser()
+
+
+def parse_json_from_output(raw: str) -> Any:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(raw):
+        if char not in "[{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(raw[index:])
+            return payload
+        except json.JSONDecodeError:
+            continue
+    raise CLIError("Failed to parse JSON from OpenClaw browser output.")
+
+
+def run_openclaw(*args: str) -> str:
+    binary = shutil.which("openclaw")
+    if not binary:
+        raise CLIError("`openclaw` CLI not found. Install OpenClaw or use `monarch auth import-token`.")
+
+    proc = subprocess.run(
+        [binary, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        stdout = proc.stdout.strip()
+        detail = stderr or stdout or f"exit code {proc.returncode}"
+        raise CLIError(detail)
+    return proc.stdout
+
+
+def extract_browser_token(browser_profile: str) -> dict[str, Any] | None:
+    js = (
+        '() => { try { '
+        'const raw = localStorage.getItem("persist:root"); '
+        'if (!raw) return {ok:false}; '
+        'const root = JSON.parse(raw); '
+        'if (!root.user) return {ok:false}; '
+        'const user = JSON.parse(root.user); '
+        'return {ok:Boolean(user.token), token:user.token || null, email:user.email || null, name:user.name || null}; '
+        '} catch (err) { return {ok:false, error:String(err)}; } }'
+    )
+    output = run_openclaw(
+        "browser",
+        "--browser-profile",
+        browser_profile,
+        "evaluate",
+        "--fn",
+        js,
+    )
+    payload = parse_json_from_output(output)
+    if isinstance(payload, dict) and payload.get("ok") and payload.get("token"):
+        return payload
+    return None
+
+
+def save_token_auth(args: argparse.Namespace, token: str, source: str, metadata: dict[str, Any] | None = None) -> Path:
+    auth_file = auth_file_from_args(args)
+    now = utcnow_iso()
+    payload: dict[str, Any] = {
+        "token": token,
+        "created_at": now,
+        "last_verified_at": now,
+        "source": source,
+    }
+    if metadata:
+        payload.update({key: value for key, value in metadata.items() if value is not None})
+    return save_auth_payload(auth_file, payload)
+
+
+def build_verified_payload(details: dict[str, Any]) -> dict[str, Any]:
+    subscription = details.get("subscription", {})
+    return {
+        "authenticated": True,
+        "premium": subscription.get("hasPremiumEntitlement"),
+        "free_trial": subscription.get("isOnFreeTrial"),
+    }
+
+
+def active_token_from_args(args: argparse.Namespace) -> str | None:
+    return args.token or load_auth_token(auth_file_from_args(args))
+
+
 def nested_value(payload: dict[str, Any], *path: str) -> Any:
     current: Any = payload
     for key in path:
@@ -241,13 +376,14 @@ async def get_authenticated_client(
     args: argparse.Namespace,
 ) -> tuple[Any, Any]:
     session_file = session_file_from_args(args)
+    token = active_token_from_args(args)
     sdk, client = create_client(
         session_file=session_file,
         timeout=args.timeout,
-        token=args.token,
+        token=token,
     )
 
-    if args.token:
+    if token:
         return sdk, client
 
     require_saved_session(client, session_file)
@@ -319,16 +455,110 @@ async def handle_auth_login(args: argparse.Namespace) -> int:
     return 0
 
 
+async def handle_auth_login_web(args: argparse.Namespace) -> int:
+    run_openclaw("browser", "--browser-profile", args.browser_profile, "start")
+    run_openclaw(
+        "browser",
+        "--browser-profile",
+        args.browser_profile,
+        "open",
+        "https://app.monarch.com/login?route=%2F",
+    )
+
+    deadline = time.time() + args.timeout_seconds
+    token_payload: dict[str, Any] | None = None
+    while time.time() < deadline:
+        token_payload = extract_browser_token(args.browser_profile)
+        if token_payload:
+            break
+        time.sleep(2)
+
+    if not token_payload:
+        raise CLIError(
+            "Timed out waiting for Monarch web login. Finish the login in the OpenClaw browser, then retry."
+        )
+
+    sdk, client = create_client(
+        session_file=session_file_from_args(args),
+        timeout=args.timeout,
+        token=token_payload["token"],
+    )
+    try:
+        details = await client.get_subscription_details()
+    except sdk.LoginFailedException as exc:
+        raise CLIError(str(exc)) from exc
+    except sdk.RequestFailedException as exc:
+        raise CLIError(str(exc)) from exc
+
+    auth_file = save_token_auth(
+        args,
+        token_payload["token"],
+        source="login-web",
+        metadata={
+            "email": token_payload.get("email"),
+            "name": token_payload.get("name"),
+        },
+    )
+
+    payload = {
+        "status": "logged in",
+        "auth_file": auth_file,
+        "source": "login-web",
+        **build_verified_payload(details),
+    }
+    if args.as_json:
+        emit_json(payload)
+    else:
+        print_key_values(payload)
+    return 0
+
+
+async def handle_auth_import_token(args: argparse.Namespace) -> int:
+    token = args.import_token or args.token or os.environ.get("MONARCH_TOKEN")
+    if not token:
+        raise CLIError("Provide a token argument or set MONARCH_TOKEN.")
+
+    sdk, client = create_client(
+        session_file=session_file_from_args(args),
+        timeout=args.timeout,
+        token=token,
+    )
+    try:
+        details = await client.get_subscription_details()
+    except sdk.LoginFailedException as exc:
+        raise CLIError(str(exc)) from exc
+    except sdk.RequestFailedException as exc:
+        raise CLIError(str(exc)) from exc
+
+    auth_file = save_token_auth(args, token, source="import-token")
+    payload = {
+        "status": "token imported",
+        "auth_file": auth_file,
+        **build_verified_payload(details),
+    }
+    if args.as_json:
+        emit_json(payload)
+    else:
+        print_key_values(payload)
+    return 0
+
+
 async def handle_auth_logout(args: argparse.Namespace) -> int:
     session_file = session_file_from_args(args)
-    existed = session_file.exists()
-    if existed:
+    auth_file = auth_file_from_args(args)
+    session_removed = session_file.exists()
+    auth_removed = auth_file.exists()
+    if session_removed:
         session_file.unlink()
+    if auth_removed:
+        auth_file.unlink()
 
     payload = {
         "status": "logged out",
         "session_file": session_file,
-        "removed": existed,
+        "session_removed": session_removed,
+        "auth_file": auth_file,
+        "auth_removed": auth_removed,
     }
     if args.as_json:
         emit_json(payload)
@@ -339,23 +569,30 @@ async def handle_auth_logout(args: argparse.Namespace) -> int:
 
 async def handle_auth_status(args: argparse.Namespace) -> int:
     session_file = session_file_from_args(args)
+    auth_file = auth_file_from_args(args)
+    auth_payload = load_auth_payload(auth_file)
+    token = active_token_from_args(args)
     payload: dict[str, Any] = {
         "session_file": session_file,
-        "exists": session_file.exists(),
+        "session_exists": session_file.exists(),
+        "auth_file": auth_file,
+        "auth_exists": auth_file.exists(),
+        "source": auth_payload.get("source") if auth_payload else None,
+        "email": auth_payload.get("email") if auth_payload else None,
     }
 
     if args.check:
-        if not session_file.exists() and not args.token:
+        if not token and not session_file.exists():
             raise CLIError(
-                f"No saved session found at `{session_file}`. Run `monarch auth login` first."
+                f"No saved auth found at `{auth_file}` and no saved session at `{session_file}`. Run `monarch auth login-web` or `monarch auth import-token` first."
             )
 
         sdk, client = create_client(
             session_file=session_file,
             timeout=args.timeout,
-            token=args.token,
+            token=token,
         )
-        if not args.token:
+        if not token:
             client.load_session(str(session_file))
 
         try:
@@ -365,14 +602,11 @@ async def handle_auth_status(args: argparse.Namespace) -> int:
         except sdk.RequestFailedException as exc:
             raise CLIError(str(exc)) from exc
 
-        subscription = details.get("subscription", {})
-        payload.update(
-            {
-                "authenticated": True,
-                "premium": subscription.get("hasPremiumEntitlement"),
-                "free_trial": subscription.get("isOnFreeTrial"),
-            }
-        )
+        payload.update(build_verified_payload(details))
+        if auth_payload:
+            auth_payload["last_verified_at"] = utcnow_iso()
+            save_auth_payload(auth_file, auth_payload)
+            payload["last_verified_at"] = auth_payload["last_verified_at"]
 
     if args.as_json:
         emit_json(payload)

@@ -26,11 +26,21 @@ pip install -e .
 
 ## Login
 
+Preferred flow:
+
 ```bash
-monarch auth login
+monarch auth login-web
 ```
 
-The CLI stores the saved session at `~/.config/monarch-cli/session.pickle` by default.
+This uses the OpenClaw browser, extracts a Monarch API token after web login, and saves it to `~/.config/monarch-cli/auth.json` by default.
+
+Fallback:
+
+```bash
+monarch auth import-token <token>
+```
+
+Legacy password/session login still exists as `monarch auth login`, but Monarch's old REST login flow is brittle and should not be the default path.
 
 ## Examples
 
