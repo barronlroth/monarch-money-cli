@@ -147,6 +147,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     accounts_list_parser.set_defaults(handler=handle_accounts_list)
 
+    holdings_parser = subparsers.add_parser("holdings", help="Inspect investment holdings.")
+    holdings_subparsers = holdings_parser.add_subparsers(
+        dest="holdings_command",
+        required=True,
+    )
+
+    holdings_list_parser = holdings_subparsers.add_parser(
+        "list",
+        parents=[json_parent],
+        help="List holdings for an investment account.",
+    )
+    holdings_list_parser.add_argument("account_id", help="Account ID to inspect.")
+    holdings_list_parser.set_defaults(handler=handle_holdings_list)
+
     transactions_parser = subparsers.add_parser(
         "transactions",
         help="Inspect transactions.",
@@ -194,6 +208,21 @@ def build_parser() -> argparse.ArgumentParser:
     transactions_show_parser.add_argument("transaction_id", help="Transaction ID to inspect.")
     transactions_show_parser.set_defaults(handler=handle_transaction_show)
 
+    recurring_parser = subparsers.add_parser("recurring", help="Inspect recurring transactions.")
+    recurring_subparsers = recurring_parser.add_subparsers(
+        dest="recurring_command",
+        required=True,
+    )
+
+    recurring_list_parser = recurring_subparsers.add_parser(
+        "list",
+        parents=[json_parent],
+        help="List recurring transactions.",
+    )
+    recurring_list_parser.add_argument("--start-date", help="Filter start date (YYYY-MM-DD).")
+    recurring_list_parser.add_argument("--end-date", help="Filter end date (YYYY-MM-DD).")
+    recurring_list_parser.set_defaults(handler=handle_recurring_list)
+
     budgets_parser = subparsers.add_parser("budgets", help="Inspect budgets.")
     budgets_subparsers = budgets_parser.add_subparsers(
         dest="budgets_command",
@@ -210,6 +239,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Budget month in YYYY-MM format. Defaults to the current month.",
     )
     budgets_list_parser.set_defaults(handler=handle_budgets_list)
+
+    credit_parser = subparsers.add_parser("credit", help="Inspect credit history.")
+    credit_subparsers = credit_parser.add_subparsers(
+        dest="credit_command",
+        required=True,
+    )
+
+    credit_history_parser = credit_subparsers.add_parser(
+        "history",
+        parents=[json_parent],
+        help="Show credit history.",
+    )
+    credit_history_parser.set_defaults(handler=handle_credit_history)
+
+    balances_parser = subparsers.add_parser("balances", help="Inspect balance history and snapshots.")
+    balances_subparsers = balances_parser.add_subparsers(
+        dest="balances_command",
+        required=True,
+    )
+
+    balances_recent_parser = balances_subparsers.add_parser(
+        "recent",
+        parents=[json_parent],
+        help="Show recent account balances.",
+    )
+    balances_recent_parser.add_argument("--start-date", help="Filter start date (YYYY-MM-DD).")
+    balances_recent_parser.set_defaults(handler=handle_balances_recent)
 
     cashflow_parser = subparsers.add_parser("cashflow", help="Inspect cashflow.")
     cashflow_subparsers = cashflow_parser.add_subparsers(
@@ -646,6 +702,35 @@ async def handle_accounts_list(args: argparse.Namespace) -> int:
     return 0
 
 
+async def handle_holdings_list(args: argparse.Namespace) -> int:
+    sdk, client = await get_authenticated_client(args)
+    try:
+        response = await client.get_account_holdings(int(args.account_id))
+    except (sdk.RequestFailedException, ValueError) as exc:
+        raise CLIError(str(exc)) from exc
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    edges = nested_value(response, "portfolio", "aggregateHoldings", "edges") or []
+    rows = []
+    for edge in edges:
+        holding = edge.get("node", {})
+        rows.append(
+            [
+                nested_value(holding, "security", "ticker") or nested_value(holding, "security", "name"),
+                format_money(holding.get("quantity")),
+                format_money(holding.get("totalValue") or holding.get("value") or holding.get("marketValue")),
+                format_money(holding.get("basis") or holding.get("costBasis")),
+                nested_value(holding, "security", "typeDisplay"),
+            ]
+        )
+
+    print_table(["security", "quantity", "value", "basis", "type"], rows)
+    return 0
+
+
 async def handle_transactions_list(args: argparse.Namespace) -> int:
     validate_date_pair(args.start_date, args.end_date)
     sdk, client = await get_authenticated_client(args)
@@ -723,6 +808,40 @@ async def handle_transaction_show(args: argparse.Namespace) -> int:
     return 0
 
 
+async def handle_recurring_list(args: argparse.Namespace) -> int:
+    validate_date_pair(args.start_date, args.end_date)
+    sdk, client = await get_authenticated_client(args)
+    try:
+        response = await client.get_recurring_transactions(
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+    except sdk.RequestFailedException as exc:
+        raise CLIError(str(exc)) from exc
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    rows = []
+    items = response.get("recurringTransactionItems") or response.get("recurringTransactionStreamGroups") or []
+    for item in items:
+        stream = item.get("stream", {})
+        merchant = nested_value(stream, "merchant", "name") or nested_value(item, "merchant", "name")
+        rows.append(
+            [
+                item.get("date", "") or item.get("nextOccurrenceDate", ""),
+                merchant,
+                stream.get("frequency", item.get("frequency", "")),
+                format_money(item.get("amount") or stream.get("amount")),
+                nested_value(item, "category", "name"),
+            ]
+        )
+
+    print_table(["date", "merchant", "frequency", "amount", "category"], rows)
+    return 0
+
+
 async def handle_budgets_list(args: argparse.Namespace) -> int:
     sdk, client = await get_authenticated_client(args)
 
@@ -766,6 +885,64 @@ async def handle_budgets_list(args: argparse.Namespace) -> int:
     return 0
 
 
+async def handle_credit_history(args: argparse.Namespace) -> int:
+    sdk, client = await get_authenticated_client(args)
+    try:
+        response = await client.get_credit_history()
+    except sdk.RequestFailedException as exc:
+        raise CLIError(str(exc)) from exc
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    items = response.get("creditScoreSnapshots") or response.get("creditScoreHistory") or []
+    rows = []
+    for item in items:
+        rows.append([
+            item.get("date", ""),
+            item.get("score", ""),
+            item.get("rating", ""),
+        ])
+
+    if rows:
+        print_table(["date", "score", "rating"], rows)
+    else:
+        print_key_values(
+            {
+                "status": nested_value(response, "spinwheelUser", "creditScoreTrackingStatus") or "unknown",
+                "snapshots": len(items),
+            }
+        )
+    return 0
+
+
+async def handle_balances_recent(args: argparse.Namespace) -> int:
+    sdk, client = await get_authenticated_client(args)
+    try:
+        response = await client.get_recent_account_balances(start_date=args.start_date)
+    except sdk.RequestFailedException as exc:
+        raise CLIError(str(exc)) from exc
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    rows = []
+    balances = response.get("accounts") or response.get("recentAccountBalances") or []
+    for item in balances:
+        series = item.get("recentBalances") or []
+        latest = series[-1] if series else item.get("currentBalance") or item.get("balance")
+        rows.append([
+            item.get("id", ""),
+            item.get("displayName") or item.get("name", ""),
+            format_money(latest),
+            len(series),
+        ])
+    print_table(["id", "account", "latest_balance", "points"], rows)
+    return 0
+
+
 async def handle_cashflow_summary(args: argparse.Namespace) -> int:
     validate_date_pair(args.start_date, args.end_date)
     sdk, client = await get_authenticated_client(args)
@@ -781,7 +958,11 @@ async def handle_cashflow_summary(args: argparse.Namespace) -> int:
         emit_json(response)
         return 0
 
-    summary = nested_value(response, "summary", "summary")
+    summary_root = response.get("summary")
+    if isinstance(summary_root, list):
+        summary = nested_value(summary_root[0] if summary_root else {}, "summary")
+    else:
+        summary = nested_value(response, "summary", "summary")
     payload = {
         "income": format_money(nested_value(summary, "sumIncome")),
         "expense": format_money(nested_value(summary, "sumExpense")),

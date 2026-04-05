@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "monarch-money-cli"
 version = "0.1.0"
-description = "CLI wrapper for the unofficial Monarch Money Python client"
+description = "CLI for Monarch Money built on the maintained community Python backend"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "monarchmoney>=0.1.15",
+  "monarchmoneycommunity>=1.2.0",
 ]
 
 [project.scripts]

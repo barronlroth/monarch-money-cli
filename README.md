@@ -1,18 +1,24 @@
 # monarch-money-cli
 
-Small CLI wrapper around the unofficial `monarchmoney` Python client.
+Read-first CLI for Monarch Money built on the maintained `monarchmoneycommunity` backend.
 
 ## Status
 
-This repo currently targets a practical V1:
+Current focus is read-heavy CLI access with simple auth:
 
 - `auth login`
+- `auth login-web`
+- `auth import-token`
 - `auth logout`
 - `auth status`
 - `accounts list`
+- `holdings list`
 - `transactions list`
 - `transactions show`
+- `recurring list`
 - `budgets list`
+- `credit history`
+- `balances recent`
 - `cashflow summary`
 - `refresh accounts`
 
@@ -40,15 +46,19 @@ Fallback:
 monarch auth import-token <token>
 ```
 
-Legacy password/session login still exists as `monarch auth login`, but Monarch's old REST login flow is brittle and should not be the default path.
+`monarch auth login` still works for password/session-based login through the maintained community backend, but `login-web` and `import-token` are often simpler.
 
 ## Examples
 
 ```bash
 monarch accounts list
+monarch holdings list <account-id>
 monarch transactions list --limit 20
 monarch transactions show <transaction-id>
+monarch recurring list
 monarch budgets list --month 2026-04
+monarch credit history
+monarch balances recent
 monarch cashflow summary --start-date 2026-04-01 --end-date 2026-04-30
 monarch refresh accounts --wait
 ```
