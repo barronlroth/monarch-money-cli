@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import inspect
 import json
 import os
@@ -9,8 +10,9 @@ import shutil
 import subprocess
 import sys
 import time
+import webbrowser
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Sequence, TypeVar
 
 from .client import CLIError, create_client, require_saved_session
 from .config import (
@@ -24,6 +26,17 @@ from .config import (
 )
 from .dates import current_month_bounds, month_bounds, validate_date_pair
 from .render import emit_json, format_money, format_percent, print_key_values, print_table
+
+ResponseT = TypeVar("ResponseT")
+LOGIN_URL = "https://app.monarch.com/login?route=%2F"
+TOKEN_COPY_SNIPPET = """copy((() => {
+  const raw = localStorage.getItem("persist:root");
+  if (!raw) return "";
+  const root = JSON.parse(raw);
+  if (!root.user) return "";
+  const user = JSON.parse(root.user);
+  return user.token || "";
+})())"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,18 +101,24 @@ def build_parser() -> argparse.ArgumentParser:
     login_web_parser = auth_subparsers.add_parser(
         "login-web",
         parents=[json_parent],
-        help="Open Monarch in the OpenClaw browser and save a token.",
+        help="Open Monarch in a browser and save a token.",
+    )
+    login_web_parser.add_argument(
+        "--browser",
+        choices=("system", "openclaw"),
+        default=os.environ.get("MONARCH_LOGIN_BROWSER", "system"),
+        help="Browser flow to use. Defaults to the system browser.",
     )
     login_web_parser.add_argument(
         "--browser-profile",
         default=os.environ.get("MONARCH_BROWSER_PROFILE", "openclaw"),
-        help="OpenClaw browser profile to use.",
+        help="OpenClaw browser profile to use when --browser openclaw is selected.",
     )
     login_web_parser.add_argument(
         "--timeout-seconds",
         type=int,
         default=int(os.environ.get("MONARCH_LOGIN_TIMEOUT_SECONDS", "300")),
-        help="Seconds to wait for web login to complete.",
+        help="Seconds to wait for web login to complete when --browser openclaw is selected.",
     )
     login_web_parser.set_defaults(handler=handle_auth_login_web)
 
@@ -146,6 +165,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="List connected accounts.",
     )
     accounts_list_parser.set_defaults(handler=handle_accounts_list)
+
+    accounts_history_parser = accounts_subparsers.add_parser(
+        "history",
+        parents=[json_parent],
+        help="Show balance history for an account.",
+    )
+    accounts_history_parser.add_argument("account_id", help="Account ID to inspect.")
+    accounts_history_parser.set_defaults(handler=handle_account_history)
 
     holdings_parser = subparsers.add_parser("holdings", help="Inspect investment holdings.")
     holdings_subparsers = holdings_parser.add_subparsers(
@@ -208,6 +235,27 @@ def build_parser() -> argparse.ArgumentParser:
     transactions_show_parser.add_argument("transaction_id", help="Transaction ID to inspect.")
     transactions_show_parser.set_defaults(handler=handle_transaction_show)
 
+    transactions_summary_parser = transactions_subparsers.add_parser(
+        "summary",
+        parents=[json_parent],
+        help="Show aggregate transaction summary.",
+    )
+    transactions_summary_parser.set_defaults(handler=handle_transactions_summary)
+
+    transactions_categories_parser = transactions_subparsers.add_parser(
+        "categories",
+        parents=[json_parent],
+        help="List transaction categories.",
+    )
+    transactions_categories_parser.set_defaults(handler=handle_transaction_categories)
+
+    transactions_tags_parser = transactions_subparsers.add_parser(
+        "tags",
+        parents=[json_parent],
+        help="List transaction tags.",
+    )
+    transactions_tags_parser.set_defaults(handler=handle_transaction_tags)
+
     recurring_parser = subparsers.add_parser("recurring", help="Inspect recurring transactions.")
     recurring_subparsers = recurring_parser.add_subparsers(
         dest="recurring_command",
@@ -239,6 +287,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Budget month in YYYY-MM format. Defaults to the current month.",
     )
     budgets_list_parser.set_defaults(handler=handle_budgets_list)
+
+    institutions_parser = subparsers.add_parser("institutions", help="Inspect linked institutions.")
+    institutions_subparsers = institutions_parser.add_subparsers(
+        dest="institutions_command",
+        required=True,
+    )
+
+    institutions_list_parser = institutions_subparsers.add_parser(
+        "list",
+        parents=[json_parent],
+        help="List linked institutions and sync status.",
+    )
+    institutions_list_parser.set_defaults(handler=handle_institutions_list)
 
     credit_parser = subparsers.add_parser("credit", help="Inspect credit history.")
     credit_subparsers = credit_parser.add_subparsers(
@@ -392,6 +453,41 @@ def extract_browser_token(browser_profile: str) -> dict[str, Any] | None:
     return None
 
 
+def open_system_browser(url: str) -> None:
+    try:
+        opened = webbrowser.open(url)
+    except webbrowser.Error as exc:
+        raise CLIError(f"Failed to open the system browser: {exc}") from exc
+
+    if opened:
+        print(f"Opened Monarch login in your default browser: {url}", file=sys.stderr)
+    else:
+        print(f"Open this URL in your browser: {url}", file=sys.stderr)
+
+
+def prompt_system_browser_token() -> str:
+    if not sys.stdin.isatty():
+        raise CLIError(
+            "System browser login requires an interactive terminal. Use `monarch auth import-token` or `monarch auth login-web --browser openclaw` instead."
+        )
+
+    print("Log in to Monarch in your browser, then open DevTools Console.", file=sys.stderr)
+    print("Run this snippet to copy the API token to your clipboard:", file=sys.stderr)
+    print(TOKEN_COPY_SNIPPET, file=sys.stderr)
+    print("", file=sys.stderr)
+    print("If `copy(...)` is unavailable, run the inner function and paste the returned string.", file=sys.stderr)
+    print("Press Enter after you have copied the token.", file=sys.stderr)
+    try:
+        input()
+    except EOFError as exc:
+        raise CLIError("No token provided.") from exc
+
+    token = getpass.getpass("Paste Monarch token: ", stream=sys.stderr).strip()
+    if not token:
+        raise CLIError("No token provided.")
+    return token
+
+
 def save_token_auth(args: argparse.Namespace, token: str, source: str, metadata: dict[str, Any] | None = None) -> Path:
     auth_file = auth_file_from_args(args)
     now = utcnow_iso()
@@ -428,22 +524,83 @@ def nested_value(payload: dict[str, Any], *path: str) -> Any:
     return current if current is not None else ""
 
 
-async def get_authenticated_client(
+def first_defined(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return ""
+
+
+def request_status_code(exc: BaseException) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if isinstance(response_status, int):
+        return response_status
+
+    return None
+
+
+def is_auth_failure(exc: BaseException) -> bool:
+    status_code = request_status_code(exc)
+    if status_code in {401, 403}:
+        return True
+
+    message = str(exc).lower()
+    auth_markers = (
+        "401",
+        "403",
+        "auth",
+        "forbidden",
+        "login",
+        "session",
+        "token",
+        "unauthorized",
+    )
+    return any(marker in message for marker in auth_markers)
+
+
+async def run_authenticated_operation(
     args: argparse.Namespace,
-) -> tuple[Any, Any]:
+    operation: Callable[[Any], Awaitable[ResponseT]],
+) -> ResponseT:
     session_file = session_file_from_args(args)
+
+    async def run_with_session() -> ResponseT:
+        sdk, client = create_client(
+            session_file=session_file,
+            timeout=args.timeout,
+        )
+        require_saved_session(client, session_file)
+        try:
+            return await operation(client)
+        except sdk.LoginFailedException as exc:
+            raise CLIError(str(exc)) from exc
+        except sdk.RequestFailedException as exc:
+            raise CLIError(str(exc)) from exc
+
     token = active_token_from_args(args)
+    if not token:
+        return await run_with_session()
+
     sdk, client = create_client(
         session_file=session_file,
         timeout=args.timeout,
         token=token,
     )
-
-    if token:
-        return sdk, client
-
-    require_saved_session(client, session_file)
-    return sdk, client
+    try:
+        return await operation(client)
+    except sdk.LoginFailedException as exc:
+        if session_file.exists():
+            return await run_with_session()
+        raise CLIError(str(exc)) from exc
+    except sdk.RequestFailedException as exc:
+        if session_file.exists() and is_auth_failure(exc):
+            return await run_with_session()
+        raise CLIError(str(exc)) from exc
 
 
 async def handle_auth_login(args: argparse.Namespace) -> int:
@@ -512,27 +669,32 @@ async def handle_auth_login(args: argparse.Namespace) -> int:
 
 
 async def handle_auth_login_web(args: argparse.Namespace) -> int:
-    run_openclaw("browser", "--browser-profile", args.browser_profile, "start")
-    run_openclaw(
-        "browser",
-        "--browser-profile",
-        args.browser_profile,
-        "open",
-        "https://app.monarch.com/login?route=%2F",
-    )
-
-    deadline = time.time() + args.timeout_seconds
     token_payload: dict[str, Any] | None = None
-    while time.time() < deadline:
-        token_payload = extract_browser_token(args.browser_profile)
-        if token_payload:
-            break
-        time.sleep(2)
 
-    if not token_payload:
-        raise CLIError(
-            "Timed out waiting for Monarch web login. Finish the login in the OpenClaw browser, then retry."
+    if args.browser == "openclaw":
+        run_openclaw("browser", "--browser-profile", args.browser_profile, "start")
+        run_openclaw(
+            "browser",
+            "--browser-profile",
+            args.browser_profile,
+            "open",
+            LOGIN_URL,
         )
+
+        deadline = time.time() + args.timeout_seconds
+        while time.time() < deadline:
+            token_payload = extract_browser_token(args.browser_profile)
+            if token_payload:
+                break
+            time.sleep(2)
+
+        if not token_payload:
+            raise CLIError(
+                "Timed out waiting for Monarch web login. Finish the login in the OpenClaw browser, then retry."
+            )
+    else:
+        open_system_browser(LOGIN_URL)
+        token_payload = {"token": prompt_system_browser_token()}
 
     sdk, client = create_client(
         session_file=session_file_from_args(args),
@@ -549,7 +711,7 @@ async def handle_auth_login_web(args: argparse.Namespace) -> int:
     auth_file = save_token_auth(
         args,
         token_payload["token"],
-        source="login-web",
+        source=f"login-web-{args.browser}",
         metadata={
             "email": token_payload.get("email"),
             "name": token_payload.get("name"),
@@ -559,7 +721,7 @@ async def handle_auth_login_web(args: argparse.Namespace) -> int:
     payload = {
         "status": "logged in",
         "auth_file": auth_file,
-        "source": "login-web",
+        "source": f"login-web-{args.browser}",
         **build_verified_payload(details),
     }
     if args.as_json:
@@ -672,11 +834,10 @@ async def handle_auth_status(args: argparse.Namespace) -> int:
 
 
 async def handle_accounts_list(args: argparse.Namespace) -> int:
-    sdk, client = await get_authenticated_client(args)
-    try:
-        response = await client.get_accounts()
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_accounts(),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -688,7 +849,7 @@ async def handle_accounts_list(args: argparse.Namespace) -> int:
             [
                 account.get("id", ""),
                 account.get("displayName", ""),
-                format_money(account.get("displayBalance") or account.get("currentBalance")),
+                format_money(first_defined(account.get("displayBalance"), account.get("currentBalance"))),
                 nested_value(account, "type", "display"),
                 nested_value(account, "institution", "name"),
                 account.get("displayLastUpdatedAt", ""),
@@ -702,12 +863,43 @@ async def handle_accounts_list(args: argparse.Namespace) -> int:
     return 0
 
 
-async def handle_holdings_list(args: argparse.Namespace) -> int:
-    sdk, client = await get_authenticated_client(args)
+async def handle_account_history(args: argparse.Namespace) -> int:
     try:
-        response = await client.get_account_holdings(int(args.account_id))
-    except (sdk.RequestFailedException, ValueError) as exc:
+        account_id = int(args.account_id)
+    except ValueError as exc:
         raise CLIError(str(exc)) from exc
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_account_history(account_id),
+    )
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    rows = []
+    for snapshot in response:
+        rows.append(
+            [
+                snapshot.get("date", ""),
+                format_money(first_defined(snapshot.get("signedBalance"), snapshot.get("balance"))),
+                snapshot.get("accountName", ""),
+            ]
+        )
+
+    print_table(["date", "balance", "account"], rows)
+    return 0
+
+
+async def handle_holdings_list(args: argparse.Namespace) -> int:
+    try:
+        account_id = int(args.account_id)
+    except ValueError as exc:
+        raise CLIError(str(exc)) from exc
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_account_holdings(account_id),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -721,8 +913,8 @@ async def handle_holdings_list(args: argparse.Namespace) -> int:
             [
                 nested_value(holding, "security", "ticker") or nested_value(holding, "security", "name"),
                 format_money(holding.get("quantity")),
-                format_money(holding.get("totalValue") or holding.get("value") or holding.get("marketValue")),
-                format_money(holding.get("basis") or holding.get("costBasis")),
+                format_money(first_defined(holding.get("totalValue"), holding.get("value"), holding.get("marketValue"))),
+                format_money(first_defined(holding.get("basis"), holding.get("costBasis"))),
                 nested_value(holding, "security", "typeDisplay"),
             ]
         )
@@ -733,9 +925,9 @@ async def handle_holdings_list(args: argparse.Namespace) -> int:
 
 async def handle_transactions_list(args: argparse.Namespace) -> int:
     validate_date_pair(args.start_date, args.end_date)
-    sdk, client = await get_authenticated_client(args)
-    try:
-        response = await client.get_transactions(
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_transactions(
             limit=args.limit,
             offset=args.offset,
             start_date=args.start_date,
@@ -744,9 +936,8 @@ async def handle_transactions_list(args: argparse.Namespace) -> int:
             account_ids=args.account_id,
             category_ids=args.category_id,
             tag_ids=args.tag_id,
-        )
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+        ),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -779,11 +970,10 @@ async def handle_transactions_list(args: argparse.Namespace) -> int:
 
 
 async def handle_transaction_show(args: argparse.Namespace) -> int:
-    sdk, client = await get_authenticated_client(args)
-    try:
-        response = await client.get_transaction_details(args.transaction_id)
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_transaction_details(args.transaction_id),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -808,16 +998,97 @@ async def handle_transaction_show(args: argparse.Namespace) -> int:
     return 0
 
 
+async def handle_transactions_summary(args: argparse.Namespace) -> int:
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_transactions_summary(),
+    )
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    summary_root = response.get("aggregates")
+    if isinstance(summary_root, list):
+        summary = nested_value(summary_root[0] if summary_root else {}, "summary")
+    else:
+        summary = nested_value(response, "aggregates", "summary")
+    payload = {
+        "count": nested_value(summary, "count"),
+        "avg": format_money(nested_value(summary, "avg")),
+        "net": format_money(nested_value(summary, "sum")),
+        "income": format_money(nested_value(summary, "sumIncome")),
+        "expense": format_money(nested_value(summary, "sumExpense")),
+        "max": format_money(nested_value(summary, "max")),
+        "max_expense": format_money(nested_value(summary, "maxExpense")),
+        "first": nested_value(summary, "first"),
+        "last": nested_value(summary, "last"),
+    }
+    print_key_values(payload)
+    return 0
+
+
+async def handle_transaction_categories(args: argparse.Namespace) -> int:
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_transaction_categories(),
+    )
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    rows = []
+    for category in response.get("categories", []):
+        rows.append(
+            [
+                category.get("id", ""),
+                category.get("name", ""),
+                nested_value(category, "group", "name"),
+                nested_value(category, "group", "type"),
+                category.get("isDisabled", False),
+                category.get("isSystemCategory", False),
+            ]
+        )
+
+    print_table(["id", "name", "group", "type", "disabled", "system"], rows)
+    return 0
+
+
+async def handle_transaction_tags(args: argparse.Namespace) -> int:
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_transaction_tags(),
+    )
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    rows = []
+    for tag in response.get("householdTransactionTags", []):
+        rows.append(
+            [
+                tag.get("id", ""),
+                tag.get("name", ""),
+                tag.get("color", ""),
+                tag.get("transactionCount", 0),
+            ]
+        )
+
+    print_table(["id", "name", "color", "transaction_count"], rows)
+    return 0
+
+
 async def handle_recurring_list(args: argparse.Namespace) -> int:
     validate_date_pair(args.start_date, args.end_date)
-    sdk, client = await get_authenticated_client(args)
-    try:
-        response = await client.get_recurring_transactions(
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_recurring_transactions(
             start_date=args.start_date,
             end_date=args.end_date,
-        )
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+        ),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -833,7 +1104,7 @@ async def handle_recurring_list(args: argparse.Namespace) -> int:
                 item.get("date", "") or item.get("nextOccurrenceDate", ""),
                 merchant,
                 stream.get("frequency", item.get("frequency", "")),
-                format_money(item.get("amount") or stream.get("amount")),
+                format_money(first_defined(item.get("amount"), stream.get("amount"))),
                 nested_value(item, "category", "name"),
             ]
         )
@@ -843,17 +1114,15 @@ async def handle_recurring_list(args: argparse.Namespace) -> int:
 
 
 async def handle_budgets_list(args: argparse.Namespace) -> int:
-    sdk, client = await get_authenticated_client(args)
-
     if args.month:
         start_date, end_date = month_bounds(args.month)
     else:
         start_date, end_date = current_month_bounds()
 
-    try:
-        response = await client.get_budgets(start_date=start_date, end_date=end_date)
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_budgets(start_date=start_date, end_date=end_date),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -886,11 +1155,10 @@ async def handle_budgets_list(args: argparse.Namespace) -> int:
 
 
 async def handle_credit_history(args: argparse.Namespace) -> int:
-    sdk, client = await get_authenticated_client(args)
-    try:
-        response = await client.get_credit_history()
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_credit_history(),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -917,12 +1185,49 @@ async def handle_credit_history(args: argparse.Namespace) -> int:
     return 0
 
 
+async def handle_institutions_list(args: argparse.Namespace) -> int:
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_institutions(),
+    )
+
+    if args.as_json:
+        emit_json(response)
+        return 0
+
+    accounts_by_credential: dict[str, int] = {}
+    for account in response.get("accounts", []):
+        credential_id = nested_value(account, "credential", "id")
+        if credential_id:
+            accounts_by_credential[credential_id] = accounts_by_credential.get(credential_id, 0) + 1
+
+    rows = []
+    for credential in response.get("credentials", []):
+        credential_id = credential.get("id", "")
+        rows.append(
+            [
+                credential_id,
+                nested_value(credential, "institution", "name"),
+                credential.get("dataProvider", ""),
+                credential.get("displayLastUpdatedAt", ""),
+                credential.get("updateRequired", False),
+                bool(credential.get("disconnectedFromDataProviderAt")),
+                accounts_by_credential.get(credential_id, 0),
+            ]
+        )
+
+    print_table(
+        ["credential_id", "institution", "provider", "last_updated", "update_required", "disconnected", "accounts"],
+        rows,
+    )
+    return 0
+
+
 async def handle_balances_recent(args: argparse.Namespace) -> int:
-    sdk, client = await get_authenticated_client(args)
-    try:
-        response = await client.get_recent_account_balances(start_date=args.start_date)
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_recent_account_balances(start_date=args.start_date),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -930,12 +1235,20 @@ async def handle_balances_recent(args: argparse.Namespace) -> int:
 
     rows = []
     balances = response.get("accounts") or response.get("recentAccountBalances") or []
+    accounts_response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_accounts(),
+    )
+    account_names = {
+        account.get("id", ""): account.get("displayName") or account.get("name", "")
+        for account in accounts_response.get("accounts", [])
+    }
     for item in balances:
         series = item.get("recentBalances") or []
-        latest = series[-1] if series else item.get("currentBalance") or item.get("balance")
+        latest = series[-1] if series else first_defined(item.get("currentBalance"), item.get("balance"))
         rows.append([
             item.get("id", ""),
-            item.get("displayName") or item.get("name", ""),
+            account_names.get(item.get("id", ""), ""),
             format_money(latest),
             len(series),
         ])
@@ -945,14 +1258,13 @@ async def handle_balances_recent(args: argparse.Namespace) -> int:
 
 async def handle_cashflow_summary(args: argparse.Namespace) -> int:
     validate_date_pair(args.start_date, args.end_date)
-    sdk, client = await get_authenticated_client(args)
-    try:
-        response = await client.get_cashflow_summary(
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_cashflow_summary(
             start_date=args.start_date,
             end_date=args.end_date,
-        )
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+        ),
+    )
 
     if args.as_json:
         emit_json(response)
@@ -974,32 +1286,34 @@ async def handle_cashflow_summary(args: argparse.Namespace) -> int:
 
 
 async def handle_refresh_accounts(args: argparse.Namespace) -> int:
-    sdk, client = await get_authenticated_client(args)
     account_ids = list(args.account_id)
 
     if not account_ids:
-        try:
-            response = await client.get_accounts()
-        except sdk.RequestFailedException as exc:
-            raise CLIError(str(exc)) from exc
+        response = await run_authenticated_operation(
+            args,
+            lambda client: client.get_accounts(),
+        )
         account_ids = [account.get("id", "") for account in response.get("accounts", [])]
         account_ids = [account_id for account_id in account_ids if account_id]
 
     if not account_ids:
         raise CLIError("No accounts found to refresh.")
 
-    try:
-        if args.wait:
-            completed = await client.request_accounts_refresh_and_wait(
+    if args.wait:
+        completed = await run_authenticated_operation(
+            args,
+            lambda client: client.request_accounts_refresh_and_wait(
                 account_ids=account_ids,
                 timeout=args.wait_timeout,
                 delay=args.wait_delay,
-            )
-        else:
-            await client.request_accounts_refresh(account_ids)
-            completed = True
-    except sdk.RequestFailedException as exc:
-        raise CLIError(str(exc)) from exc
+            ),
+        )
+    else:
+        await run_authenticated_operation(
+            args,
+            lambda client: client.request_accounts_refresh(account_ids),
+        )
+        completed = True
 
     payload = {
         "requested": len(account_ids),

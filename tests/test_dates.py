@@ -1,6 +1,8 @@
 import unittest
 from datetime import date
 
+import _path
+
 from monarch_cli.dates import current_month_bounds, month_bounds, validate_date_pair
 
 
@@ -25,4 +27,3 @@ class DateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

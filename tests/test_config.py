@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import _path
+
 from monarch_cli.config import (
     default_auth_file,
     default_config_dir,
@@ -52,4 +54,3 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

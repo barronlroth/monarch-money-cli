@@ -1,5 +1,7 @@
 import unittest
 
+import _path
+
 from monarch_cli.render import build_table, format_money, format_percent
 
 

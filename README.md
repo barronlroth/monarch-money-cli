@@ -12,11 +12,16 @@ Current focus is read-heavy CLI access with simple auth:
 - `auth logout`
 - `auth status`
 - `accounts list`
+- `accounts history`
 - `holdings list`
 - `transactions list`
 - `transactions show`
+- `transactions summary`
+- `transactions categories`
+- `transactions tags`
 - `recurring list`
 - `budgets list`
+- `institutions list`
 - `credit history`
 - `balances recent`
 - `cashflow summary`
@@ -38,7 +43,13 @@ Preferred flow:
 monarch auth login-web
 ```
 
-This uses the OpenClaw browser, extracts a Monarch API token after web login, and saves it to `~/.config/monarch-cli/auth.json` by default.
+This opens Monarch in your normal browser by default, then prompts you to paste a token copied from DevTools. The CLI verifies the token and saves it to `~/.config/monarch-cli/auth.json`.
+
+If you prefer automatic extraction through OpenClaw:
+
+```bash
+monarch auth login-web --browser openclaw
+```
 
 Fallback:
 
@@ -52,11 +63,16 @@ monarch auth import-token <token>
 
 ```bash
 monarch accounts list
+monarch accounts history <account-id>
 monarch holdings list <account-id>
 monarch transactions list --limit 20
 monarch transactions show <transaction-id>
+monarch transactions summary
+monarch transactions categories
+monarch transactions tags
 monarch recurring list
 monarch budgets list --month 2026-04
+monarch institutions list
 monarch credit history
 monarch balances recent
 monarch cashflow summary --start-date 2026-04-01 --end-date 2026-04-30
@@ -70,4 +86,3 @@ Most read commands support `--json` for scripting.
 ```bash
 monarch transactions list --limit 50 --json
 ```
-
