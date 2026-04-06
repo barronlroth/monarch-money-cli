@@ -3,6 +3,7 @@ import contextlib
 import io
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -151,6 +152,81 @@ class ParserTests(unittest.TestCase):
         args = parser.parse_args(["auth", "login-web"])
         self.assertEqual(args.browser, "system")
 
+    def test_accounts_history_defaults_to_90_day_window(self) -> None:
+        parser = cli.build_parser()
+        args = parser.parse_args(["accounts", "history", "123"])
+        self.assertFalse(args.all_history)
+        self.assertIsNone(args.days)
+        self.assertFalse(args.summary)
+
+
+class HistoryWindowTests(unittest.TestCase):
+    def make_snapshot(self, day: str, balance: float) -> dict[str, object]:
+        return {"date": day, "signedBalance": balance, "accountName": "Checking"}
+
+    def test_filter_account_history_defaults_to_last_90_days(self) -> None:
+        snapshots = [
+            self.make_snapshot("2025-12-31", 90),
+            self.make_snapshot("2026-01-01", 100),
+            self.make_snapshot("2026-01-31", 110),
+            self.make_snapshot("2026-02-15", 120),
+            self.make_snapshot("2026-03-01", 130),
+            self.make_snapshot("2026-03-31", 140),
+        ]
+        filtered = cli.filter_account_history_snapshots(
+            snapshots,
+            start_date=None,
+            end_date=None,
+            days=None,
+            include_all=False,
+            limit=None,
+        )
+        self.assertEqual(
+            [item["date"] for item in filtered],
+            ["2026-01-01", "2026-01-31", "2026-02-15", "2026-03-01", "2026-03-31"],
+        )
+
+    def test_filter_account_history_respects_days_and_limit(self) -> None:
+        snapshots = [
+            self.make_snapshot("2026-03-25", 100),
+            self.make_snapshot("2026-03-26", 110),
+            self.make_snapshot("2026-03-27", 120),
+            self.make_snapshot("2026-03-28", 130),
+            self.make_snapshot("2026-03-29", 140),
+            self.make_snapshot("2026-03-30", 150),
+            self.make_snapshot("2026-03-31", 160),
+        ]
+        filtered = cli.filter_account_history_snapshots(
+            snapshots,
+            start_date=None,
+            end_date=None,
+            days=3,
+            include_all=False,
+            limit=2,
+        )
+        self.assertEqual([item["date"] for item in filtered], ["2026-03-30", "2026-03-31"])
+
+    def test_build_account_history_summary_uses_absolute_start_for_pct(self) -> None:
+        summary = cli.build_account_history_summary(
+            [
+                self.make_snapshot("2026-03-01", -100),
+                self.make_snapshot("2026-03-31", -50),
+            ]
+        )
+        self.assertEqual(summary["change"], 50.0)
+        self.assertEqual(summary["change_pct"], 0.5)
+
+    def test_validate_history_args_rejects_conflicting_flags(self) -> None:
+        args = SimpleNamespace(
+            all_history=True,
+            days=30,
+            start_date=None,
+            end_date=None,
+            limit=None,
+        )
+        with self.assertRaises(ValueError):
+            cli.validate_history_args(args)
+
 
 class LoginWebTests(unittest.TestCase):
     def test_handle_auth_login_web_uses_system_browser_flow(self) -> None:
@@ -202,7 +278,16 @@ class HandlerRenderingTests(unittest.TestCase):
     def test_handle_account_history_prints_balance_rows(self) -> None:
         output = self.capture_handler(
             cli.handle_account_history,
-            SimpleNamespace(account_id="101", as_json=False),
+            SimpleNamespace(
+                account_id="101",
+                as_json=False,
+                start_date=None,
+                end_date=None,
+                days=None,
+                limit=None,
+                summary=False,
+                all_history=False,
+            ),
             [
                 {"date": "2026-04-01", "signedBalance": 0, "accountName": "Checking"},
                 {"date": "2026-04-02", "signedBalance": 1180, "accountName": "Checking"},
@@ -212,6 +297,29 @@ class HandlerRenderingTests(unittest.TestCase):
         self.assertIn("0.00", output)
         self.assertIn("1,180.00", output)
         self.assertIn("Checking", output)
+
+    def test_handle_account_history_summary_prints_compact_metrics(self) -> None:
+        output = self.capture_handler(
+            cli.handle_account_history,
+            SimpleNamespace(
+                account_id="101",
+                as_json=False,
+                start_date=None,
+                end_date=None,
+                days=None,
+                limit=None,
+                summary=True,
+                all_history=False,
+            ),
+            [
+                {"date": "2026-03-01", "signedBalance": 1000, "accountName": "Checking"},
+                {"date": "2026-03-31", "signedBalance": 1250, "accountName": "Checking"},
+            ],
+        )
+        self.assertIn("starting_balance", output)
+        self.assertIn("1,000.00", output)
+        self.assertIn("250.00", output)
+        self.assertIn("25.00%", output)
 
     def test_handle_transactions_summary_prints_key_metrics(self) -> None:
         output = self.capture_handler(
@@ -301,7 +409,7 @@ class HandlerRenderingTests(unittest.TestCase):
 
     def test_handle_balances_recent_joins_account_names(self) -> None:
         buffer = io.StringIO()
-        args = SimpleNamespace(as_json=False, start_date=None)
+        args = SimpleNamespace(as_json=False, start_date=None, account_id=[])
         responses = [
             {
                 "accounts": [
@@ -327,6 +435,35 @@ class HandlerRenderingTests(unittest.TestCase):
         self.assertIn("Checking", output)
         self.assertIn("Savings", output)
         self.assertIn("0.00", output)
+        self.assertIn("-10.00", output)
+
+    def test_handle_balances_recent_filters_account_ids(self) -> None:
+        buffer = io.StringIO()
+        args = SimpleNamespace(as_json=False, start_date=None, account_id=["acct-2"])
+        responses = [
+            {
+                "accounts": [
+                    {"id": "acct-1", "recentBalances": [10, 15]},
+                    {"id": "acct-2", "recentBalances": [25, 30]},
+                ]
+            },
+            {
+                "accounts": [
+                    {"id": "acct-1", "displayName": "Checking"},
+                    {"id": "acct-2", "displayName": "Savings"},
+                ]
+            },
+        ]
+        with (
+            mock.patch.object(cli, "run_authenticated_operation", mock.AsyncMock(side_effect=responses)),
+            contextlib.redirect_stdout(buffer),
+        ):
+            exit_code = asyncio.run(cli.handle_balances_recent(args))
+
+        self.assertEqual(exit_code, 0)
+        output = buffer.getvalue()
+        self.assertNotIn("Checking", output)
+        self.assertIn("Savings", output)
 
 
 if __name__ == "__main__":

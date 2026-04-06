@@ -64,6 +64,8 @@ monarch auth import-token <token>
 ```bash
 monarch accounts list
 monarch accounts history <account-id>
+monarch accounts history <account-id> --summary
+monarch accounts history <account-id> --days 30
 monarch holdings list <account-id>
 monarch transactions list --limit 20
 monarch transactions show <transaction-id>
@@ -75,9 +77,12 @@ monarch budgets list --month 2026-04
 monarch institutions list
 monarch credit history
 monarch balances recent
+monarch balances recent --account-id <account-id>
 monarch cashflow summary --start-date 2026-04-01 --end-date 2026-04-30
 monarch refresh accounts --wait
 ```
+
+`accounts history` shows the last 90 days by default. Use `--all` for the full series, or refine the window with `--start-date`, `--end-date`, `--days`, `--limit`, and `--summary`.
 
 ## JSON Output
 

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import date, timedelta
 import webbrowser
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence, TypeVar
@@ -29,6 +30,7 @@ from .render import emit_json, format_money, format_percent, print_key_values, p
 
 ResponseT = TypeVar("ResponseT")
 LOGIN_URL = "https://app.monarch.com/login?route=%2F"
+DEFAULT_HISTORY_DAYS = 90
 TOKEN_COPY_SNIPPET = """copy((() => {
   const raw = localStorage.getItem("persist:root");
   if (!raw) return "";
@@ -172,6 +174,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show balance history for an account.",
     )
     accounts_history_parser.add_argument("account_id", help="Account ID to inspect.")
+    accounts_history_parser.add_argument(
+        "--start-date",
+        help="Filter start date (YYYY-MM-DD). Requires --end-date.",
+    )
+    accounts_history_parser.add_argument(
+        "--end-date",
+        help="Filter end date (YYYY-MM-DD). Requires --start-date.",
+    )
+    accounts_history_parser.add_argument(
+        "--days",
+        type=int,
+        help=f"Show the last N days. Defaults to {DEFAULT_HISTORY_DAYS}.",
+    )
+    accounts_history_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Limit the number of rows after filtering.",
+    )
+    accounts_history_parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Show a compact summary instead of daily rows.",
+    )
+    accounts_history_parser.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_history",
+        help=f"Show the full history instead of the default {DEFAULT_HISTORY_DAYS}-day window.",
+    )
     accounts_history_parser.set_defaults(handler=handle_account_history)
 
     holdings_parser = subparsers.add_parser("holdings", help="Inspect investment holdings.")
@@ -326,6 +357,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show recent account balances.",
     )
     balances_recent_parser.add_argument("--start-date", help="Filter start date (YYYY-MM-DD).")
+    balances_recent_parser.add_argument(
+        "--account-id",
+        action="append",
+        default=[],
+        help="Repeat to limit output to specific account IDs.",
+    )
     balances_recent_parser.set_defaults(handler=handle_balances_recent)
 
     cashflow_parser = subparsers.add_parser("cashflow", help="Inspect cashflow.")
@@ -529,6 +566,165 @@ def first_defined(*values: Any) -> Any:
         if value is not None and value != "":
             return value
     return ""
+
+
+def parse_cli_date(value: str, flag_name: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{flag_name} must use YYYY-MM-DD format.") from exc
+
+
+def numeric_value(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def snapshot_balance(snapshot: dict[str, Any]) -> Any:
+    return first_defined(snapshot.get("signedBalance"), snapshot.get("balance"))
+
+
+def validate_history_args(args: argparse.Namespace) -> None:
+    validate_date_pair(args.start_date, args.end_date)
+    if args.all_history and (args.days is not None or args.start_date or args.end_date):
+        raise ValueError("`--all` cannot be combined with --days or explicit date filters.")
+    if args.days is not None:
+        if args.days < 1:
+            raise ValueError("`--days` must be at least 1.")
+        if args.start_date or args.end_date:
+            raise ValueError("`--days` cannot be combined with --start-date/--end-date.")
+    if args.limit is not None and args.limit < 1:
+        raise ValueError("`--limit` must be at least 1.")
+
+
+def filter_account_history_snapshots(
+    snapshots: list[dict[str, Any]],
+    *,
+    start_date: str | None,
+    end_date: str | None,
+    days: int | None,
+    include_all: bool,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    dated_snapshots: list[tuple[date, dict[str, Any]]] = []
+    for snapshot in snapshots:
+        raw_date = snapshot.get("date")
+        if not raw_date:
+            continue
+        dated_snapshots.append((parse_cli_date(raw_date, "snapshot date"), snapshot))
+
+    if not dated_snapshots:
+        return []
+
+    if include_all:
+        filtered = [snapshot for _, snapshot in dated_snapshots]
+    else:
+        if start_date and end_date:
+            range_start = parse_cli_date(start_date, "--start-date")
+            range_end = parse_cli_date(end_date, "--end-date")
+        else:
+            range_end = dated_snapshots[-1][0]
+            window_days = days or DEFAULT_HISTORY_DAYS
+            range_start = range_end - timedelta(days=window_days - 1)
+
+        if range_start > range_end:
+            raise ValueError("`--start-date` must be on or before `--end-date`.")
+
+        filtered = [
+            snapshot
+            for snapshot_date, snapshot in dated_snapshots
+            if range_start <= snapshot_date <= range_end
+        ]
+
+    if limit is not None:
+        filtered = filtered[-limit:]
+
+    return filtered
+
+
+def build_account_history_summary(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+    if not snapshots:
+        return {
+            "account": "",
+            "start_date": "",
+            "end_date": "",
+            "points": 0,
+            "starting_balance": None,
+            "latest_balance": None,
+            "change": None,
+            "change_pct": None,
+            "min_balance": None,
+            "max_balance": None,
+        }
+
+    values = [numeric_value(snapshot_balance(snapshot)) for snapshot in snapshots]
+    numeric_balances = [value for value in values if value is not None]
+    starting_balance = numeric_value(snapshot_balance(snapshots[0]))
+    latest_balance = numeric_value(snapshot_balance(snapshots[-1]))
+    change = None
+    change_pct = None
+    if starting_balance is not None and latest_balance is not None:
+        change = latest_balance - starting_balance
+        if starting_balance != 0:
+            change_pct = change / abs(starting_balance)
+
+    return {
+        "account": first_defined(snapshots[-1].get("accountName"), snapshots[0].get("accountName")),
+        "start_date": snapshots[0].get("date", ""),
+        "end_date": snapshots[-1].get("date", ""),
+        "points": len(snapshots),
+        "starting_balance": starting_balance,
+        "latest_balance": latest_balance,
+        "change": change,
+        "change_pct": change_pct,
+        "min_balance": min(numeric_balances) if numeric_balances else None,
+        "max_balance": max(numeric_balances) if numeric_balances else None,
+    }
+
+
+def build_recent_balance_rows(
+    balances: list[dict[str, Any]],
+    accounts: list[dict[str, Any]],
+    *,
+    selected_account_ids: list[str],
+) -> list[dict[str, Any]]:
+    account_names = {
+        account.get("id", ""): first_defined(account.get("displayName"), account.get("name"))
+        for account in accounts
+    }
+    selected_ids = set(selected_account_ids)
+
+    rows = []
+    for item in balances:
+        account_id = item.get("id", "")
+        if selected_ids and account_id not in selected_ids:
+            continue
+
+        series = item.get("recentBalances") or []
+        start_balance = series[0] if series else first_defined(item.get("currentBalance"), item.get("balance"))
+        latest_balance = series[-1] if series else first_defined(item.get("currentBalance"), item.get("balance"))
+        start_numeric = numeric_value(start_balance)
+        latest_numeric = numeric_value(latest_balance)
+        change = None
+        if start_numeric is not None and latest_numeric is not None:
+            change = latest_numeric - start_numeric
+
+        rows.append(
+            {
+                "id": account_id,
+                "account": account_names.get(account_id, ""),
+                "start_balance": start_balance,
+                "latest_balance": latest_balance,
+                "change": change,
+                "points": len(series),
+            }
+        )
+
+    return rows
 
 
 def request_status_code(exc: BaseException) -> int | None:
@@ -864,6 +1060,7 @@ async def handle_accounts_list(args: argparse.Namespace) -> int:
 
 
 async def handle_account_history(args: argparse.Namespace) -> int:
+    validate_history_args(args)
     try:
         account_id = int(args.account_id)
     except ValueError as exc:
@@ -872,13 +1069,46 @@ async def handle_account_history(args: argparse.Namespace) -> int:
         args,
         lambda client: client.get_account_history(account_id),
     )
+    snapshots = filter_account_history_snapshots(
+        response,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        days=args.days,
+        include_all=args.all_history,
+        limit=args.limit,
+    )
+    summary = build_account_history_summary(snapshots)
 
     if args.as_json:
-        emit_json(response)
+        if args.summary:
+            emit_json(summary)
+        else:
+            emit_json(snapshots)
+        return 0
+
+    if not snapshots:
+        print("No results.")
+        return 0
+
+    if args.summary:
+        print_key_values(
+            {
+                "account": summary["account"],
+                "start_date": summary["start_date"],
+                "end_date": summary["end_date"],
+                "points": summary["points"],
+                "starting_balance": format_money(summary["starting_balance"]),
+                "latest_balance": format_money(summary["latest_balance"]),
+                "change": format_money(summary["change"]),
+                "change_pct": format_percent(summary["change_pct"]),
+                "min_balance": format_money(summary["min_balance"]),
+                "max_balance": format_money(summary["max_balance"]),
+            }
+        )
         return 0
 
     rows = []
-    for snapshot in response:
+    for snapshot in snapshots:
         rows.append(
             [
                 snapshot.get("date", ""),
@@ -1228,31 +1458,34 @@ async def handle_balances_recent(args: argparse.Namespace) -> int:
         args,
         lambda client: client.get_recent_account_balances(start_date=args.start_date),
     )
-
-    if args.as_json:
-        emit_json(response)
-        return 0
-
-    rows = []
     balances = response.get("accounts") or response.get("recentAccountBalances") or []
     accounts_response = await run_authenticated_operation(
         args,
         lambda client: client.get_accounts(),
     )
-    account_names = {
-        account.get("id", ""): account.get("displayName") or account.get("name", "")
-        for account in accounts_response.get("accounts", [])
-    }
-    for item in balances:
-        series = item.get("recentBalances") or []
-        latest = series[-1] if series else first_defined(item.get("currentBalance"), item.get("balance"))
-        rows.append([
-            item.get("id", ""),
-            account_names.get(item.get("id", ""), ""),
-            format_money(latest),
-            len(series),
-        ])
-    print_table(["id", "account", "latest_balance", "points"], rows)
+    rows = build_recent_balance_rows(
+        balances,
+        accounts_response.get("accounts", []),
+        selected_account_ids=args.account_id,
+    )
+
+    if args.as_json:
+        emit_json({"accounts": rows})
+        return 0
+
+    print_table(
+        ["account", "start_balance", "latest_balance", "change", "points"],
+        [
+            [
+                row["account"],
+                format_money(row["start_balance"]),
+                format_money(row["latest_balance"]),
+                format_money(row["change"]),
+                row["points"],
+            ]
+            for row in rows
+        ],
+    )
     return 0
 
 
