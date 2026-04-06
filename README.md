@@ -23,16 +23,38 @@ Current focus is read-heavy CLI access with simple auth:
 - `budgets list`
 - `institutions list`
 - `credit history`
+- `networth history`
+- `networth by-type`
 - `balances recent`
 - `cashflow summary`
 - `refresh accounts`
 
 ## Install
 
+User install with `pipx`:
+
+```bash
+pipx install .
+```
+
+From GitHub:
+
+```bash
+pipx install git+https://github.com/barronlroth/monarch-money-cli.git
+```
+
+Editable development install:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
+```
+
+For release checks and wheel/sdist builds, also install `build` into the same environment:
+
+```bash
+pip install build
 ```
 
 ## Login
@@ -76,6 +98,10 @@ monarch recurring list
 monarch budgets list --month 2026-04
 monarch institutions list
 monarch credit history
+monarch networth history
+monarch networth history --summary
+monarch networth history --account-type brokerage --days 30
+monarch networth by-type --latest
 monarch balances recent
 monarch balances recent --account-id <account-id>
 monarch cashflow summary --start-date 2026-04-01 --end-date 2026-04-30
@@ -84,6 +110,8 @@ monarch refresh accounts --wait
 
 `accounts history` shows the last 90 days by default. Use `--all` for the full series, or refine the window with `--start-date`, `--end-date`, `--days`, `--limit`, and `--summary`.
 
+`networth history` uses the same default 90-day window and supports the same history flags, plus `--account-type` to focus on one backend account type. `networth by-type` shows account-type trends and supports `--latest` to collapse to the most recent period.
+
 ## JSON Output
 
 Most read commands support `--json` for scripting.
@@ -91,3 +119,13 @@ Most read commands support `--json` for scripting.
 ```bash
 monarch transactions list --limit 50 --json
 ```
+
+## Release
+
+Run the release check script before tagging a version:
+
+```bash
+./scripts/release_check.sh
+```
+
+The full release flow is documented in [docs/releasing.md](/Users/barron/Developer/monarch-money-cli/docs/releasing.md).

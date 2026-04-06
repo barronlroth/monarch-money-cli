@@ -345,6 +345,79 @@ def build_parser() -> argparse.ArgumentParser:
     )
     credit_history_parser.set_defaults(handler=handle_credit_history)
 
+    networth_parser = subparsers.add_parser("networth", help="Inspect aggregate net worth trends.")
+    networth_subparsers = networth_parser.add_subparsers(
+        dest="networth_command",
+        required=True,
+    )
+
+    networth_history_parser = networth_subparsers.add_parser(
+        "history",
+        parents=[json_parent],
+        help="Show aggregate net worth history.",
+    )
+    networth_history_parser.add_argument(
+        "--start-date",
+        help="Filter start date (YYYY-MM-DD). Requires --end-date.",
+    )
+    networth_history_parser.add_argument(
+        "--end-date",
+        help="Filter end date (YYYY-MM-DD). Requires --start-date.",
+    )
+    networth_history_parser.add_argument(
+        "--days",
+        type=int,
+        help=f"Show the last N days. Defaults to {DEFAULT_HISTORY_DAYS}.",
+    )
+    networth_history_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Limit the number of rows after filtering.",
+    )
+    networth_history_parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Show a compact summary instead of daily rows.",
+    )
+    networth_history_parser.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_history",
+        help=f"Show the full history instead of the default {DEFAULT_HISTORY_DAYS}-day window.",
+    )
+    networth_history_parser.add_argument(
+        "--account-type",
+        help="Optional backend account type filter such as brokerage, depository, loan, or credit.",
+    )
+    networth_history_parser.set_defaults(handler=handle_networth_history)
+
+    networth_by_type_parser = networth_subparsers.add_parser(
+        "by-type",
+        parents=[json_parent],
+        help="Show net worth trends grouped by account type.",
+    )
+    networth_by_type_parser.add_argument(
+        "--start-date",
+        help="Start date (YYYY-MM-DD). Defaults to the last 12 months for monthly trends or 5 years for yearly trends.",
+    )
+    networth_by_type_parser.add_argument(
+        "--timeframe",
+        choices=("month", "year"),
+        default="month",
+        help="Snapshot granularity. Defaults to month.",
+    )
+    networth_by_type_parser.add_argument(
+        "--group",
+        choices=("asset", "liability", "other"),
+        help="Filter account types by group.",
+    )
+    networth_by_type_parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Show only the latest available period for each account type.",
+    )
+    networth_by_type_parser.set_defaults(handler=handle_networth_by_type)
+
     balances_parser = subparsers.add_parser("balances", help="Inspect balance history and snapshots.")
     balances_subparsers = balances_parser.add_subparsers(
         dest="balances_command",
@@ -725,6 +798,82 @@ def build_recent_balance_rows(
         )
 
     return rows
+
+
+def resolve_history_request_dates(
+    *,
+    start_date: str | None,
+    end_date: str | None,
+    days: int | None,
+    include_all: bool,
+    today: date | None = None,
+) -> tuple[str | None, str | None]:
+    if include_all:
+        return None, None
+
+    if start_date and end_date:
+        return start_date, end_date
+
+    current_day = today or date.today()
+    window_days = days or DEFAULT_HISTORY_DAYS
+    return (
+        (current_day - timedelta(days=window_days - 1)).isoformat(),
+        current_day.isoformat(),
+    )
+
+
+def default_networth_by_type_start_date(timeframe: str, today: date | None = None) -> str:
+    current_day = today or date.today()
+    if timeframe == "year":
+        return date(current_day.year - 4, 1, 1).isoformat()
+    return date(current_day.year - 1, current_day.month, 1).isoformat()
+
+
+def validate_networth_by_type_args(args: argparse.Namespace) -> None:
+    if args.start_date:
+        parse_cli_date(args.start_date, "--start-date")
+
+
+def build_networth_type_rows(
+    snapshots: list[dict[str, Any]],
+    account_types: list[dict[str, Any]],
+    *,
+    group_filter: str | None,
+    latest_only: bool,
+) -> tuple[list[dict[str, Any]], str | None]:
+    groups_by_type = {
+        account_type.get("name", ""): account_type.get("group", "")
+        for account_type in account_types
+    }
+
+    rows = []
+    for snapshot in snapshots:
+        account_type = snapshot.get("accountType", "")
+        row = {
+            "period": snapshot.get("month", ""),
+            "account_type": account_type,
+            "group": groups_by_type.get(account_type, ""),
+            "balance": snapshot.get("balance"),
+        }
+        if group_filter and row["group"] != group_filter:
+            continue
+        rows.append(row)
+
+    latest_period = None
+    if latest_only and rows:
+        latest_period = max(row["period"] for row in rows)
+        rows = [row for row in rows if row["period"] == latest_period]
+        rows.sort(
+            key=lambda row: (
+                numeric_value(row["balance"]) is None,
+                -(numeric_value(row["balance"]) or 0),
+                row["account_type"],
+            )
+        )
+    else:
+        rows.sort(key=lambda row: (row["period"], row["account_type"]))
+
+    return rows, latest_period
 
 
 def request_status_code(exc: BaseException) -> int | None:
@@ -1412,6 +1561,129 @@ async def handle_credit_history(args: argparse.Namespace) -> int:
                 "snapshots": len(items),
             }
         )
+    return 0
+
+
+async def handle_networth_history(args: argparse.Namespace) -> int:
+    validate_history_args(args)
+    request_start_date, request_end_date = resolve_history_request_dates(
+        start_date=args.start_date,
+        end_date=args.end_date,
+        days=args.days,
+        include_all=args.all_history,
+    )
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_aggregate_snapshots(
+            start_date=request_start_date,
+            end_date=request_end_date,
+            account_type=args.account_type,
+        ),
+    )
+    snapshots = filter_account_history_snapshots(
+        response.get("aggregateSnapshots", []),
+        start_date=args.start_date,
+        end_date=args.end_date,
+        days=args.days,
+        include_all=args.all_history,
+        limit=args.limit,
+    )
+    summary = build_account_history_summary(snapshots)
+    summary["account_type"] = args.account_type or "all"
+
+    if args.as_json:
+        if args.summary:
+            emit_json(summary)
+        else:
+            emit_json(snapshots)
+        return 0
+
+    if not snapshots:
+        print("No results.")
+        return 0
+
+    if args.summary:
+        print_key_values(
+            {
+                "account_type": summary["account_type"],
+                "start_date": summary["start_date"],
+                "end_date": summary["end_date"],
+                "points": summary["points"],
+                "starting_balance": format_money(summary["starting_balance"]),
+                "latest_balance": format_money(summary["latest_balance"]),
+                "change": format_money(summary["change"]),
+                "change_pct": format_percent(summary["change_pct"]),
+                "min_balance": format_money(summary["min_balance"]),
+                "max_balance": format_money(summary["max_balance"]),
+            }
+        )
+        return 0
+
+    rows = []
+    previous_balance: float | None = None
+    for snapshot in snapshots:
+        balance = numeric_value(snapshot_balance(snapshot))
+        change = None if previous_balance is None or balance is None else balance - previous_balance
+        rows.append(
+            [
+                snapshot.get("date", ""),
+                format_money(balance),
+                format_money(change),
+            ]
+        )
+        if balance is not None:
+            previous_balance = balance
+
+    print_table(["date", "balance", "change"], rows)
+    return 0
+
+
+async def handle_networth_by_type(args: argparse.Namespace) -> int:
+    validate_networth_by_type_args(args)
+    start_date = args.start_date or default_networth_by_type_start_date(args.timeframe)
+    response = await run_authenticated_operation(
+        args,
+        lambda client: client.get_account_snapshots_by_type(
+            start_date=start_date,
+            timeframe=args.timeframe,
+        ),
+    )
+    rows, latest_period = build_networth_type_rows(
+        response.get("snapshotsByAccountType", []),
+        response.get("accountTypes", []),
+        group_filter=args.group,
+        latest_only=args.latest,
+    )
+
+    if args.as_json:
+        emit_json(
+            {
+                "start_date": start_date,
+                "timeframe": args.timeframe,
+                "group": args.group,
+                "latest_only": args.latest,
+                "latest_period": latest_period,
+                "rows": rows,
+            }
+        )
+        return 0
+
+    if not rows:
+        print("No results.")
+        return 0
+
+    print_table(
+        ["period", "account_type", "group", "balance"],
+        [
+            [
+                row["period"],
+                row["account_type"],
+                row["group"],
+                format_money(row["balance"]),
+            ]
+            for row in rows
+        ],
+    )
     return 0
 
 

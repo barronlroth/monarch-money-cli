@@ -1,0 +1,4 @@
+interface:
+  display_name: "Monarch CLI"
+  short_description: "Extend and validate this Monarch CLI"
+  default_prompt: "Use $monarch-money-cli to add, validate, or document a command in this repository."

@@ -136,6 +136,8 @@ class ParserTests(unittest.TestCase):
 
         cases = [
             (["accounts", "history", "123"], cli.handle_account_history),
+            (["networth", "history"], cli.handle_networth_history),
+            (["networth", "by-type"], cli.handle_networth_by_type),
             (["transactions", "summary"], cli.handle_transactions_summary),
             (["transactions", "categories"], cli.handle_transaction_categories),
             (["transactions", "tags"], cli.handle_transaction_tags),
@@ -158,6 +160,13 @@ class ParserTests(unittest.TestCase):
         self.assertFalse(args.all_history)
         self.assertIsNone(args.days)
         self.assertFalse(args.summary)
+
+    def test_networth_by_type_defaults_to_monthly_window(self) -> None:
+        parser = cli.build_parser()
+        args = parser.parse_args(["networth", "by-type"])
+        self.assertEqual(args.timeframe, "month")
+        self.assertFalse(args.latest)
+        self.assertIsNone(args.group)
 
 
 class HistoryWindowTests(unittest.TestCase):
@@ -226,6 +235,46 @@ class HistoryWindowTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             cli.validate_history_args(args)
+
+    def test_resolve_history_request_dates_uses_default_window(self) -> None:
+        start_date, end_date = cli.resolve_history_request_dates(
+            start_date=None,
+            end_date=None,
+            days=None,
+            include_all=False,
+            today=date(2026, 4, 5),
+        )
+        self.assertEqual(start_date, "2026-01-06")
+        self.assertEqual(end_date, "2026-04-05")
+
+    def test_default_networth_by_type_start_date_varies_by_timeframe(self) -> None:
+        self.assertEqual(
+            cli.default_networth_by_type_start_date("month", today=date(2026, 4, 5)),
+            "2025-04-01",
+        )
+        self.assertEqual(
+            cli.default_networth_by_type_start_date("year", today=date(2026, 4, 5)),
+            "2022-01-01",
+        )
+
+    def test_build_networth_type_rows_filters_to_latest_period(self) -> None:
+        rows, latest_period = cli.build_networth_type_rows(
+            [
+                {"accountType": "brokerage", "month": "2026-03", "balance": 300.0},
+                {"accountType": "credit", "month": "2026-03", "balance": -50.0},
+                {"accountType": "brokerage", "month": "2026-04", "balance": 350.0},
+                {"accountType": "credit", "month": "2026-04", "balance": -25.0},
+            ],
+            [
+                {"name": "brokerage", "group": "asset"},
+                {"name": "credit", "group": "liability"},
+            ],
+            group_filter=None,
+            latest_only=True,
+        )
+        self.assertEqual(latest_period, "2026-04")
+        self.assertEqual([row["period"] for row in rows], ["2026-04", "2026-04"])
+        self.assertEqual(rows[0]["account_type"], "brokerage")
 
 
 class LoginWebTests(unittest.TestCase):
@@ -347,6 +396,57 @@ class HandlerRenderingTests(unittest.TestCase):
         self.assertIn("42", output)
         self.assertIn("2,500.00", output)
         self.assertIn("2026-03-31", output)
+
+    def test_handle_networth_history_prints_balance_and_change(self) -> None:
+        output = self.capture_handler(
+            cli.handle_networth_history,
+            SimpleNamespace(
+                as_json=False,
+                start_date=None,
+                end_date=None,
+                days=None,
+                limit=None,
+                summary=False,
+                all_history=False,
+                account_type=None,
+            ),
+            {
+                "aggregateSnapshots": [
+                    {"date": "2026-04-01", "balance": 1000.0},
+                    {"date": "2026-04-02", "balance": 1025.0},
+                ]
+            },
+        )
+        self.assertIn("2026-04-01", output)
+        self.assertIn("1,000.00", output)
+        self.assertIn("25.00", output)
+
+    def test_handle_networth_by_type_prints_grouped_rows(self) -> None:
+        output = self.capture_handler(
+            cli.handle_networth_by_type,
+            SimpleNamespace(
+                as_json=False,
+                start_date=None,
+                timeframe="month",
+                group=None,
+                latest=True,
+            ),
+            {
+                "snapshotsByAccountType": [
+                    {"accountType": "brokerage", "month": "2026-04", "balance": 500.0},
+                    {"accountType": "credit", "month": "2026-04", "balance": -100.0},
+                    {"accountType": "brokerage", "month": "2026-03", "balance": 450.0},
+                ],
+                "accountTypes": [
+                    {"name": "brokerage", "group": "asset"},
+                    {"name": "credit", "group": "liability"},
+                ],
+            },
+        )
+        self.assertIn("brokerage", output)
+        self.assertIn("asset", output)
+        self.assertIn("500.00", output)
+        self.assertNotIn("2026-03", output)
 
     def test_handle_transaction_categories_prints_group_metadata(self) -> None:
         output = self.capture_handler(
