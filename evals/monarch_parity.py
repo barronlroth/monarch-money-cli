@@ -99,6 +99,19 @@ def flatten_first_list(payload: Any) -> list[Any]:
     return []
 
 
+def extract_cli_transactions(payload: Any) -> tuple[list[dict[str, Any]], int | None]:
+    """Extract Monarch CLI transaction rows plus backend totalCount, if present."""
+    if isinstance(payload, dict):
+        root = payload.get("allTransactions")
+        if isinstance(root, dict):
+            results = root.get("results")
+            total_count = root.get("totalCount")
+            rows = [r for r in results if isinstance(r, dict)] if isinstance(results, list) else []
+            return rows, total_count if isinstance(total_count, int) else None
+    rows = [r for r in flatten_first_list(payload) if isinstance(r, dict)]
+    return rows, None
+
+
 def record_keys(records: list[Any], max_records: int = 50) -> list[str]:
     keys: Counter[str] = Counter()
     for row in records[:max_records]:
@@ -119,6 +132,28 @@ def schema_summary(payload: Any, *, domain: str | None = None) -> dict[str, Any]
                     "keys": sorted(payload.keys()),
                     "first_types": {k: type_name(v) for k, v in list(payload.items())[:30]},
                 }
+
+    if domain == "transactions":
+        if isinstance(payload, dict):
+            for key in ("transaction_count", "total_count", "count"):
+                if isinstance(payload.get(key), int):
+                    count = payload[key]
+                    return {
+                        "record_count": count,
+                        "count_bucket": bucket_count(count),
+                        "keys": sorted(payload.keys()),
+                        "first_types": {k: type_name(v) for k, v in list(payload.items())[:30]},
+                    }
+        records, total_count = extract_cli_transactions(payload)
+        first = next((r for r in records if isinstance(r, dict)), {})
+        count = total_count if total_count is not None else len(records)
+        return {
+            "record_count": count,
+            "count_bucket": bucket_count(count),
+            "keys": record_keys(records),
+            "first_types": {k: type_name(v) for k, v in list(first.items())[:30]},
+            "fetched_count_bucket": bucket_count(len(records)),
+        }
 
     if domain == "categories" and isinstance(payload, dict):
         groups = payload.get("category_groups") or payload.get("groups") or []
@@ -258,10 +293,11 @@ class CLIAdapter:
         end_date: str,
         page_size: int = 100,
         max_pages: int = 50,
-    ) -> tuple[list[Any], int, dict[str, Any]]:
-        records: list[Any] = []
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        records: list[dict[str, Any]] = []
         total_ms = 0
         pages = 0
+        backend_total: int | None = None
         for page in range(max_pages):
             offset = page * page_size
             payload, ms = self.call([
@@ -273,12 +309,21 @@ class CLIAdapter:
                 "--json",
             ])
             total_ms += ms
-            page_records = payload if isinstance(payload, list) else flatten_first_list(payload)
+            page_records, page_total = extract_cli_transactions(payload)
+            if page_total is not None:
+                backend_total = page_total
             records.extend(page_records)
             pages += 1
             if len(page_records) < page_size:
                 break
-        return records, total_ms, {"pages": pages, "page_size": page_size, "hit_max_pages": pages >= max_pages}
+        payload = {"allTransactions": {"results": records, "totalCount": backend_total}}
+        return payload, total_ms, {
+            "pages": pages,
+            "page_size": page_size,
+            "hit_max_pages": pages >= max_pages,
+            "fetched_count_bucket": bucket_count(len(records)),
+            "backend_total_bucket": bucket_count(backend_total),
+        }
 
 
 def make_case(
@@ -347,6 +392,147 @@ def make_case(
         result["status"] = "ERROR"
         clean_error = re.sub(r"\s+", " ", str(exc))[:180]
         result["note"] = f"{note} {clean_error}".strip()
+        return result
+
+
+def make_account_overlap_case(mcp: MCPAdapter, cli: CLIAdapter) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "case_id": "accounts_id_overlap_redacted",
+        "status": "ERROR",
+        "note": "Account ID-set overlap; raw IDs/names are not persisted.",
+        "mcp_ms": None,
+        "cli_ms": None,
+        "comparison": {},
+    }
+    try:
+        mcp_payload, result["mcp_ms"] = mcp.call("GetAccounts", {})
+        cli_payload, result["cli_ms"] = cli.call(["accounts", "list", "--json"])
+        mcp_records = [r for r in flatten_first_list(mcp_payload) if isinstance(r, dict)]
+        cli_records = [r for r in flatten_first_list(cli_payload) if isinstance(r, dict)]
+        mcp_ids = {str(r.get("id")) for r in mcp_records if r.get("id") is not None}
+        cli_ids = {str(r.get("id")) for r in cli_records if r.get("id") is not None}
+        shared = mcp_ids & cli_ids
+        mcp_extra = mcp_ids - cli_ids
+        cli_extra = cli_ids - mcp_ids
+        cli_hidden = [r for r in cli_records if r.get("isHidden") or r.get("hideFromList")]
+        cli_deactivated = [r for r in cli_records if r.get("deactivatedAt")]
+        cli_inactive_ids = {
+            str(r.get("id"))
+            for r in cli_records
+            if r.get("id") is not None and (r.get("isHidden") or r.get("hideFromList") or r.get("deactivatedAt"))
+        }
+        cli_extra_inactive = cli_extra & cli_inactive_ids
+        cli_extra_records = [r for r in cli_records if r.get("id") is not None and str(r.get("id")) in cli_extra]
+        cli_extra_flag_buckets = {
+            "hidden_or_hidden_from_list": bucket_count(sum(1 for r in cli_extra_records if r.get("isHidden") or r.get("hideFromList"))),
+            "deactivated": bucket_count(sum(1 for r in cli_extra_records if r.get("deactivatedAt"))),
+            "manual": bucket_count(sum(1 for r in cli_extra_records if r.get("isManual"))),
+            "sync_disabled": bucket_count(sum(1 for r in cli_extra_records if r.get("syncDisabled"))),
+            "net_worth_excluded": bucket_count(sum(1 for r in cli_extra_records if r.get("includeInNetWorth") is False or r.get("includeBalanceInNetWorth") is False)),
+            "transactions_hidden_from_reports": bucket_count(sum(1 for r in cli_extra_records if r.get("hideTransactionsFromReports"))),
+        }
+        cli_extra_explained = bool(cli_extra) and cli_extra == cli_extra_inactive
+        exact = mcp_ids == cli_ids and bool(mcp_ids or cli_ids)
+        result["status"] = "PASS" if exact else ("WARN" if cli_extra_explained and not mcp_extra else "FAIL")
+        result["comparison"] = {
+            "exact_count_match": len(mcp_ids) == len(cli_ids),
+            "exact_id_set_match": exact,
+            "mcp_count_bucket": bucket_count(len(mcp_ids)),
+            "cli_count_bucket": bucket_count(len(cli_ids)),
+            "shared_bucket": bucket_count(len(shared)),
+            "mcp_extra_bucket": bucket_count(len(mcp_extra)),
+            "cli_extra_bucket": bucket_count(len(cli_extra)),
+            "cli_extra_inactive_bucket": bucket_count(len(cli_extra_inactive)),
+            "cli_extra_all_hidden_or_deactivated": cli_extra_explained,
+            "cli_extra_flag_buckets": cli_extra_flag_buckets,
+            "cli_hidden_or_hidden_from_list_bucket": bucket_count(len(cli_hidden)),
+            "cli_deactivated_bucket": bucket_count(len(cli_deactivated)),
+        }
+        return result
+    except Exception as exc:
+        clean_error = re.sub(r"\s+", " ", str(exc))[:180]
+        result["note"] = f"{result['note']} {clean_error}".strip()
+        return result
+
+
+def _mcp_count_from_payload(payload: Any) -> int | None:
+    summary = schema_summary(payload, domain="transactions")
+    count = summary.get("record_count")
+    return count if isinstance(count, int) else None
+
+
+def make_transaction_semantics_case(
+    mcp: MCPAdapter,
+    cli: CLIAdapter,
+    *,
+    start_date: str,
+    end_date: str,
+    page_size: int,
+    max_pages: int,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "case_id": "transactions_last_month_semantics_redacted",
+        "status": "ERROR",
+        "note": "Compare MCP totalCount to CLI backend/fetched/visibility variants; raw rows are not persisted.",
+        "mcp_ms": None,
+        "cli_ms": None,
+        "comparison": {},
+    }
+    try:
+        mcp_payload, result["mcp_ms"] = mcp.call("GetTransactions", {
+            "start_date": start_date,
+            "end_date": end_date,
+            "total_count_only": True,
+            "filters": '{"transaction_type":"All"}',
+        })
+        mcp_count = _mcp_count_from_payload(mcp_payload)
+        cli_payload, result["cli_ms"], pagination = cli.transactions_paged(
+            start_date=start_date,
+            end_date=end_date,
+            page_size=page_size,
+            max_pages=max_pages,
+        )
+        rows, cli_total = extract_cli_transactions(cli_payload)
+        non_hidden = [r for r in rows if not bool(r.get("hideFromReports") or r.get("hide_from_reports"))]
+        hidden = [r for r in rows if bool(r.get("hideFromReports") or r.get("hide_from_reports"))]
+        posted = [r for r in rows if not bool(r.get("pending"))]
+        pending = [r for r in rows if bool(r.get("pending"))]
+        non_hidden_posted = [r for r in rows if not bool(r.get("pending")) and not bool(r.get("hideFromReports") or r.get("hide_from_reports"))]
+        debit = [r for r in rows if isinstance(r.get("amount"), (int, float)) and r.get("amount") < 0]
+        credit = [r for r in rows if isinstance(r.get("amount"), (int, float)) and r.get("amount") > 0]
+        variants = {
+            "cli_backend_total": cli_total,
+            "cli_fetched_rows": len(rows),
+            "cli_non_hidden_rows": len(non_hidden),
+            "cli_posted_rows": len(posted),
+            "cli_non_hidden_posted_rows": len(non_hidden_posted),
+        }
+        matches = {name: (value == mcp_count if isinstance(value, int) and isinstance(mcp_count, int) else None) for name, value in variants.items()}
+        matched_variants = sorted(name for name, matched in matches.items() if matched)
+        if matches.get("cli_backend_total"):
+            status = "PASS"
+        elif matched_variants:
+            status = "WARN"
+        else:
+            status = "FAIL"
+        result["status"] = status
+        result["comparison"] = {
+            "exact_count_match": matches.get("cli_backend_total"),
+            "mcp_count_bucket": bucket_count(mcp_count),
+            "cli_count_bucket": bucket_count(cli_total),
+            "matched_variants": matched_variants,
+            "variant_match_flags": matches,
+            "variant_count_buckets": {name: bucket_count(value) if isinstance(value, int) else "unknown" for name, value in variants.items()},
+            "hidden_rows_bucket": bucket_count(len(hidden)),
+            "pending_rows_bucket": bucket_count(len(pending)),
+            "debit_rows_bucket": bucket_count(len(debit)),
+            "credit_rows_bucket": bucket_count(len(credit)),
+            "cli_pagination": pagination,
+        }
+        return result
+    except Exception as exc:
+        clean_error = re.sub(r"\s+", " ", str(exc))[:180]
+        result["note"] = f"{result['note']} {clean_error}".strip()
         return result
 
 
@@ -436,6 +622,7 @@ def main() -> int:
         cli_args=["accounts", "list", "--json"],
         note="Sensitive; redacted count/schema only. Count mismatch usually means visibility/default filter differences.",
     ))
+    cases.append(make_account_overlap_case(mcp, cli))
 
     if args.mode == "standard":
         cases.append(make_case(
@@ -453,8 +640,16 @@ def main() -> int:
                 page_size=args.page_size,
                 max_pages=args.max_pages,
             ),
-            domain="count_object",
-            note="CLI paged by offset until exhausted; values redacted.",
+            domain="transactions",
+            note="CLI paged by offset until exhausted and compared via backend totalCount; values redacted.",
+        ))
+        cases.append(make_transaction_semantics_case(
+            mcp,
+            cli,
+            start_date=last_month_start.isoformat(),
+            end_date=last_month_end.isoformat(),
+            page_size=args.page_size,
+            max_pages=args.max_pages,
         ))
         cases.append(make_case(
             "transactions_recent_30d_page", mcp=mcp, cli=cli,
