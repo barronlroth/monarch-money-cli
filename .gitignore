@@ -11,3 +11,6 @@ src/*.egg-info/
 .mm/
 *.pickle
 
+evals/reports/
+evals/.raw/
+
